@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"github.com/numary/go-libs/sharedapi"
+	"github.com/pborman/uuid"
+	"strings"
 	"time"
 
 	"github.com/numary/ledger/pkg/storage"
@@ -61,21 +63,13 @@ type CommitTransactionResult struct {
 	Err *TransactionCommitError `json:"error,omitempty"`
 }
 
-func (l *Ledger) processTx(ctx context.Context, ts []core.TransactionData) (Balances, []CommitTransactionResult, error) {
-	timestamp := time.Now().Format(time.RFC3339)
+func (l *Ledger) processTx(ctx context.Context, ts []core.TransactionData) (Balances, []CommitTransactionResult, []core.Log, error) {
 
-	startId := int64(0)
-	last, err := l.store.LastTransaction(ctx)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "loading last transaction")
-	}
-	if last != nil {
-		startId = last.ID + 1
-	}
+	timestamp := time.Now()
 
 	mapping, err := l.store.LoadMapping(ctx)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "loading mapping")
+		return nil, nil, nil, errors.Wrap(err, "loading mapping")
 	}
 
 	contracts := make([]core.Contract, 0)
@@ -88,7 +82,17 @@ func (l *Ledger) processTx(ctx context.Context, ts []core.TransactionData) (Bala
 	aggregatedBalances := make(map[string]map[string]int64)
 	hasError := false
 
+	lastLog, err := l.store.LastLog(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	lastLogId := uint64(0)
+	if lastLog != nil {
+		lastLogId = lastLog.ID + 1
+	}
+
 	txs := make([]core.Transaction, 0)
+	logs := make([]core.Log, 0)
 
 txLoop:
 	for i := range ts {
@@ -97,11 +101,9 @@ txLoop:
 			TransactionData: ts[i],
 		}
 
-		tx.ID = startId + int64(i)
-		tx.Timestamp = timestamp
+		tx.ID = uuid.New()
+		tx.Timestamp = timestamp.Format(time.RFC3339)
 
-		tx.Hash = core.Hash(last, &tx)
-		last = &tx
 		txs = append(txs, tx)
 
 		commitError := func(err *TransactionCommitError) {
@@ -157,7 +159,7 @@ txLoop:
 			if !ok {
 				balances, err = l.store.AggregateBalances(ctx, addr)
 				if err != nil {
-					return nil, nil, err
+					return nil, nil, nil, err
 				}
 				aggregatedBalances[addr] = balances
 			}
@@ -166,15 +168,15 @@ txLoop:
 				expectedBalance := balances[asset] - amount
 				for _, contract := range contracts {
 					if contract.Match(addr) {
-						meta, err := l.store.GetMeta(ctx, "account", addr)
+						account, err := l.store.GetAccount(ctx, addr)
 						if err != nil {
-							return nil, nil, err
+							return nil, nil, nil, err
 						}
 						ok := contract.Expr.Eval(core.EvalContext{
 							Variables: map[string]interface{}{
 								"balance": float64(expectedBalance),
 							},
-							Metadata: meta,
+							Metadata: account.Metadata,
 							Asset:    asset,
 						})
 						if !ok {
@@ -190,13 +192,20 @@ txLoop:
 		ret = append(ret, CommitTransactionResult{
 			Transaction: tx,
 		})
+		lastLogId++
+		logs = append(logs, core.Log{
+			ID:   lastLogId,
+			Type: "NEW_TRANSACTION",
+			Data: tx,
+			Hash: "",
+			Date: timestamp,
+		})
 	}
-
 	if hasError {
-		return nil, ret, ErrCommitError
+		return nil, ret, logs, ErrCommitError
 	}
 
-	return aggregatedBalances, ret, nil
+	return aggregatedBalances, ret, logs, nil
 }
 
 func (l *Ledger) Commit(ctx context.Context, ts []core.TransactionData) (Balances, []CommitTransactionResult, error) {
@@ -206,7 +215,7 @@ func (l *Ledger) Commit(ctx context.Context, ts []core.TransactionData) (Balance
 	}
 	defer unlock(ctx)
 
-	balances, ret, err := l.processTx(ctx, ts)
+	balances, ret, logs, err := l.processTx(ctx, ts)
 	if err != nil {
 		return nil, ret, err
 	}
@@ -216,7 +225,7 @@ func (l *Ledger) Commit(ctx context.Context, ts []core.TransactionData) (Balance
 		txs = append(txs, v.Transaction)
 	}
 
-	commitErrors, err := l.store.SaveTransactions(ctx, txs)
+	commitErrors, err := l.store.AppendLog(ctx, logs...)
 	if err != nil {
 		switch err {
 		case storage.ErrAborted:
@@ -248,7 +257,8 @@ func (l *Ledger) CommitPreview(ctx context.Context, ts []core.TransactionData) (
 	}
 	defer unlock(ctx)
 
-	return l.processTx(ctx, ts)
+	balances, ret, _, err := l.processTx(ctx, ts)
+	return balances, ret, err
 }
 
 func (l *Ledger) GetLastTransaction(ctx context.Context) (core.Transaction, error) {
@@ -301,20 +311,17 @@ func (l *Ledger) RevertTransaction(ctx context.Context, id string) (*core.Transa
 		return nil, err
 	}
 
-	lastTransaction, err := l.store.LastTransaction(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	rt := tx.Reverse()
 	rt.Metadata = core.Metadata{}
-	rt.Metadata.MarkReverts(fmt.Sprint(lastTransaction.ID))
+	rt.Metadata.MarkReverts(tx.ID)
 	_, ret, err := l.Commit(ctx, []core.TransactionData{rt})
 	switch err {
 	case ErrCommitError:
-		return nil, ret[0].Err
-	default:
+		return &ret[0].Transaction, ret[0].Err
+	case nil:
 		return &ret[0].Transaction, err
+	default:
+		return nil, err
 	}
 }
 
@@ -327,8 +334,9 @@ func (l *Ledger) FindAccounts(ctx context.Context, m ...query.QueryModifier) (sh
 }
 
 func (l *Ledger) GetAccount(ctx context.Context, address string) (core.Account, error) {
-	account := core.Account{
-		Address: address,
+	account, err := l.store.GetAccount(ctx, address)
+	if err != nil {
+		return core.Account{}, err
 	}
 
 	balances, err := l.store.AggregateBalances(ctx, address)
@@ -346,12 +354,6 @@ func (l *Ledger) GetAccount(ctx context.Context, address string) (core.Account, 
 	}
 
 	account.Volumes = volumes
-
-	meta, err := l.store.GetMeta(ctx, "account", address)
-	if err != nil {
-		return account, err
-	}
-	account.Metadata = meta
 
 	return account, nil
 }
@@ -373,29 +375,28 @@ func (l *Ledger) SaveMeta(ctx context.Context, targetType string, targetID strin
 		return NewValidationError("empty target id")
 	}
 
-	lastMetaID, err := l.store.LastMetaID(ctx)
+	lastId := uint64(0)
+	lastLog, err := l.store.LastLog(ctx)
 	if err != nil {
 		return err
 	}
+	if lastLog != nil {
+		lastId = lastLog.ID + 1
+	}
 
-	timestamp := time.Now().Format(time.RFC3339)
-
-	for key, value := range m {
-		lastMetaID++
-
-		err := l.store.SaveMeta(
-			ctx,
-			lastMetaID,
-			timestamp,
-			targetType,
-			targetID,
-			key,
-			string(value),
-		)
-
-		if err != nil {
-			return err
-		}
+	_, err = l.store.AppendLog(ctx, core.Log{
+		ID:   lastId,
+		Type: "SET_METADATA",
+		Data: core.SetMetadata{
+			TargetType: strings.ToUpper(targetType),
+			TargetID:   targetID,
+			Metadata:   m,
+		},
+		Hash: "",
+		Date: time.Now(),
+	})
+	if err != nil {
+		return err
 	}
 	return nil
 }
