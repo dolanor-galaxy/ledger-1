@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/numary/ledger/pkg/core"
 	"github.com/numary/ledger/pkg/ledger/query"
 	"github.com/numary/ledger/pkg/ledgertesting"
@@ -388,6 +389,9 @@ func testFindTransactions(t *testing.T, store *sqlstorage.Store) {
 	if !assert.True(t, cursor.HasMore) {
 		return
 	}
+	if !assert.EqualValues(t, 2, cursor.Total) {
+		return
+	}
 
 	cursor, err = store.FindTransactions(context.Background(), query.Query{
 		After: fmt.Sprint(cursor.Data.([]core.Transaction)[0].ID),
@@ -503,8 +507,9 @@ func testGetTransaction(t *testing.T, store *sqlstorage.Store) {
 	}
 	log1 := core.NewTransactionLog(nil, tx1)
 	log2 := core.NewTransactionLog(&log1, tx2)
-	_, err := store.AppendLog(context.Background(), log1, log2)
+	ret, err := store.AppendLog(context.Background(), log1, log2)
 	assert.NoError(t, err)
+	spew.Dump(ret)
 
 	tx, err := store.GetTransaction(context.Background(), tx1.ID)
 	if !assert.NoError(t, err) {
